@@ -1,7 +1,9 @@
+import 'dart:io' show Platform;
 import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:cookie_jar/cookie_jar.dart' as ckjar;
+import 'package:cronet_http/cronet_http.dart';
 import 'package:dio/dio.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:enough_convert/enough_convert.dart';
@@ -15,6 +17,7 @@ import 'package:hikari_novel_flutter/models/custom_exception.dart';
 import 'package:hikari_novel_flutter/models/resource.dart';
 
 import '../common/log.dart';
+import 'cronet_http_adapter.dart';
 import 'local_storage_service.dart';
 
 class ApiService extends GetxService {
@@ -101,7 +104,8 @@ class ApiService extends GetxService {
   /// - [delid] 该书在书架中的id，即bid
   Future<Resource> removeNovel({required String delid}) {
     final String url = "${wenku8Node.node}/modules/article/bookcase.php?delid=$delid";
-    return _client.get(url, charsetType: charsetType);
+    // 带 charset 会被 CF WAF 硬 403（无 cf-mitigated），详见 get() 的注释。
+    return _client.get(url, charsetType: charsetType, appendCharset: false);
   }
 
   /// 从列表移出书库
@@ -127,7 +131,8 @@ class ApiService extends GetxService {
   /// - [classId] 要获取的书架编号
   Future<Resource> getBookshelf({required int classId}) {
     final String url = "${wenku8Node.node}/modules/article/bookcase.php?classid=$classId";
-    return _client.get(url, charsetType: charsetType);
+    // 带 charset 会被 CF WAF 硬 403（无 cf-mitigated），详见 get() 的注释（书架）。
+    return _client.get(url, charsetType: charsetType, appendCharset: false);
   }
 
   /// 获取其它用户收藏的书籍
@@ -178,7 +183,8 @@ class ApiService extends GetxService {
         title = Big5Encoder().convert(title).map((b) => '%${b.toRadixString(16).padLeft(2, '0').toUpperCase()}').join();
     }
     final String url = "${wenku8Node.node}/modules/article/search.php?searchtype=articlename&searchkey=$title&page=$index";
-    return _client.get(url, charsetType: charsetType);
+    // 带 charset 会被 CF WAF 硬 403（无 cf-mitigated），详见 get() 的注释。
+    return _client.get(url, charsetType: charsetType, appendCharset: false);
   }
 
   /// 根据作者搜索小说
@@ -193,7 +199,8 @@ class ApiService extends GetxService {
         author = Big5Encoder().convert(author).map((b) => '%${b.toRadixString(16).padLeft(2, '0').toUpperCase()}').join();
     }
     final String url = "${wenku8Node.node}/modules/article/search.php?searchtype=author&searchkey=$author&page=$index";
-    return _client.get(url, charsetType: charsetType);
+    // 带 charset 会被 CF WAF 硬 403（无 cf-mitigated），详见 get() 的注释。
+    return _client.get(url, charsetType: charsetType, appendCharset: false);
   }
 
   /// 获取用户信息
@@ -274,19 +281,54 @@ class ApiService extends GetxService {
 
 class _ApiClient {
   final ckjar.CookieJar _cookieJar = ckjar.CookieJar();
-  late final Dio dio =
-      Dio(BaseOptions(headers: {...kHeader, "Referer": "${LocalStorageService.instance.getWenku8Node().node}/index.php"}, responseType: ResponseType.bytes, followRedirects: false, validateStatus: (status) => status != null))
-        ..interceptors.add(_CloudflareInterceptor())
-        ..interceptors.add(CookieManager(_cookieJar));
+
+  late final Dio dio = _createDio();
+
+  Dio _createDio() {
+    final client =
+        Dio(BaseOptions(headers: {...kHeader, "Referer": "${LocalStorageService.instance.getWenku8Node().node}/index.php"}, responseType: ResponseType.bytes, followRedirects: false, validateStatus: (status) => status != null))
+          ..interceptors.add(_CloudflareInterceptor())
+          ..interceptors.add(CookieManager(_cookieJar));
+    _enableCronet(client);
+    return client;
+  }
+
+  /// 把 dio 的传输层换成 Cronet（Chrome 自己的网络栈）。
+  ///
+  /// CF 是按客户端 TLS 指纹决定挑不挑战的：dart:io 会被一律 403 + challenge，
+  /// 而 cf_clearance 跨客户端不通用（实测 2026-10-14：带着当场解出的新鲜凭证
+  /// 照样被拒，请求头/cookie/时机/连接都排除过了）。换成 Cronet 后 challenge 归零。
+  /// 失败就安静回退 dart:io，不影响其它平台。
+  void _enableCronet(Dio client) {
+    if (!Platform.isAndroid) return;
+    try {
+      final engine = CronetEngine.build(
+        cacheMode: CacheMode.memory,
+        cacheMaxSize: 8 * 1024 * 1024,
+        userAgent: kHeader['User-Agent']!,
+      );
+      // CronetClient 会持有 engine，GC 不会把它回收掉。
+      client.httpClientAdapter = CronetDioAdapter(CronetClient.fromCronetEngine(engine));
+      Log.d('[CF] Cronet 已启用为 dio 传输层');
+    } catch (e) {
+      Log.w('[CF] Cronet 启用失败，回退 dart:io：$e');
+    }
+  }
 
   void initCookie() {
     final localCookie = LocalStorageService.instance.getCookie();
     if (localCookie == null) return;
 
-    final cookies = localCookie.split(';').map((e) => e.trim()).where((e) => e.contains('=')).map((e) {
-      final kv = e.split('=');
-      return ckjar.Cookie(kv[0], kv.sublist(1).join('='));
-    }).toList();
+    // 值里可能带 , ; 等 dart:io Cookie 不接受的字符（如 Hm_lvt_xxx=1,2）；
+    // 逐条解析、跳过坏值——它在调用方的 try 之外，抛出来会打断登录流程。
+    final cookies = <ckjar.Cookie>[];
+    for (final e in localCookie.split(';')) {
+      final i = e.indexOf('=');
+      if (i <= 0) continue;
+      try {
+        cookies.add(ckjar.Cookie(e.substring(0, i).trim(), e.substring(i + 1).trim()));
+      } catch (_) {}
+    }
 
     _cookieJar.saveFromResponse(Uri.parse(Wenku8Node.wwwWenku8Cc.node), cookies);
     _cookieJar.saveFromResponse(Uri.parse(Wenku8Node.wwwWenku8Net.node), cookies);
@@ -303,14 +345,22 @@ class _ApiClient {
     }
   }
 
-  Future<Resource> get(String url, {required CharsetType charsetType}) async {
+  /// [appendCharset] 为 false 时不附加 `charset` 参数。
+  ///
+  /// `bookcase.php` 与 `search.php` 带上该参数会被 Cloudflare WAF 直接 403
+  /// （403 且无 `cf-mitigated`，即硬拒绝而非挑战；去掉参数则正常返回）。
+  /// 这是请求特征判定，换传输层也救不了，只能不发这个参数。
+  /// 响应编码不受影响：站点默认就是 GBK/Big5。
+  Future<Resource> get(String url, {required CharsetType charsetType, bool appendCharset = true}) async {
     try {
-      if (!url.contains("?")) url += "?";
-      switch (charsetType) {
-        case CharsetType.gbk:
-          url += "&charset=gbk";
-        case CharsetType.big5Hkscs:
-          url += "&charset=big5";
+      if (appendCharset) {
+        if (!url.contains("?")) url += "?";
+        switch (charsetType) {
+          case CharsetType.gbk:
+            url += "&charset=gbk";
+          case CharsetType.big5Hkscs:
+            url += "&charset=big5";
+        }
       }
 
       Log.d("$url ${charsetType.name}");
@@ -334,8 +384,8 @@ class _ApiClient {
     if (response.statusCode != null && response.statusCode! >= 300 && response.statusCode! < 400) {
       final location = response.headers.value('location');
       if (location != null) {
-        final node = LocalStorageService.instance.getWenku8Node();
-        final redirectedResponse = await dio.get("${node.node}/$location");
+        // location 可能是绝对地址，按请求 URL 解析，避免拼成 "https://node/http://other/..."。
+        final redirectedResponse = await dio.get(response.requestOptions.uri.resolve(location).toString());
         return redirectedResponse.data;
       }
     }

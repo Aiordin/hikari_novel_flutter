@@ -140,6 +140,9 @@ void showSnackBar({
 }) {
   // Create a SnackBar widget with specified properties
   var snack = SnackBar(
+    // `margin` 只在 floating 下合法。这里显式声明，不再依赖主题——之前只给
+    // 浅色主题配了 floating，深色模式下会直接抛断言。
+    behavior: SnackBarBehavior.floating,
     margin: const EdgeInsets.symmetric(vertical: 20, horizontal: 10), // Set margin around the SnackBar
     duration: duration ?? const Duration(milliseconds: 4000), // Default duration if not provided
     content: Text(

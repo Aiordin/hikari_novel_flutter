@@ -19,6 +19,10 @@ dependencies:
   dio: ^5.3.3
   cookie_jar: ^4.0.8
   dio_cookie_manager: ^3.1.1
+  # Cronet：用 Chrome 自己的网络栈发请求。CF 按 TLS 指纹识别客户端，dart:io
+  # 会被一律 403 + challenge，换成 Cronet 后 challenge 归零。
+  cronet_http: ^1.10.0
+  http: ^1.6.0
 
   # 浏览器
   flutter_inappwebview: ^6.2.0-beta.3

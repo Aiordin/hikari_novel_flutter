@@ -147,7 +147,9 @@ class BuildMainApp extends StatelessWidget {
         //页面切换动画
         fontFamily: _isWindows ? "Microsoft YaHei" : null,
       ),
-      darkTheme: ThemeData(useMaterial3: true, colorScheme: darkColorScheme),
+      // 深色主题同样要带上 snackBarTheme：否则 behavior 回落成默认的 fixed，
+      // 与 showSnackBar() 里的 margin 冲突会直接抛断言。
+      darkTheme: ThemeData(useMaterial3: true, colorScheme: darkColorScheme, snackBarTheme: snackBarTheme),
       themeMode: currentThemeValue,
       translations: AppTranslations(),
       locale: Util.getCurrentLocale(),
